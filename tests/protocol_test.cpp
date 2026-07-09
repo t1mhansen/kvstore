@@ -55,5 +55,42 @@ TEST(ProtocolTest, UnknownVerbIsInvalid) {
   EXPECT_EQ(ParseCommand("FOO bar").type, CommandType::kInvalid);
 }
 
+TEST(ProtocolTest, ParsesSetEx) {
+  const Command command = ParseCommand("SETEX foo 60 bar");
+  EXPECT_EQ(command.type, CommandType::kSetEx);
+  EXPECT_EQ(command.key, "foo");
+  EXPECT_EQ(command.ttl_seconds, 60u);
+  EXPECT_EQ(command.value, "bar");
+}
+
+TEST(ProtocolTest, SetExValuePreservesInternalSpaces) {
+  const Command command = ParseCommand("SETEX foo 60 bar baz qux");
+  EXPECT_EQ(command.value, "bar baz qux");
+}
+
+TEST(ProtocolTest, SetExWithNonIntegerTtlIsInvalid) {
+  EXPECT_EQ(ParseCommand("SETEX foo soon bar").type, CommandType::kInvalid);
+}
+
+TEST(ProtocolTest, SetExWithNegativeTtlIsInvalid) {
+  EXPECT_EQ(ParseCommand("SETEX foo -5 bar").type, CommandType::kInvalid);
+}
+
+TEST(ProtocolTest, SetExWithNoValueIsInvalid) {
+  EXPECT_EQ(ParseCommand("SETEX foo 60").type, CommandType::kInvalid);
+}
+
+TEST(ProtocolTest, SetExWithNothingIsInvalid) {
+  EXPECT_EQ(ParseCommand("SETEX").type, CommandType::kInvalid);
+}
+
+TEST(ProtocolTest, ParsesCompact) {
+  EXPECT_EQ(ParseCommand("COMPACT").type, CommandType::kCompact);
+}
+
+TEST(ProtocolTest, CompactWithArgumentsIsInvalid) {
+  EXPECT_EQ(ParseCommand("COMPACT now").type, CommandType::kInvalid);
+}
+
 }  // namespace
 }  // namespace kv

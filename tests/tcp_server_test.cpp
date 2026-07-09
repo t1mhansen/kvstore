@@ -153,5 +153,29 @@ TEST_F(TcpServerTest, WritesAreDurableOnDisk) {
   EXPECT_EQ(independent_reader.Get("tcp_durable"), "yes");
 }
 
+TEST_F(TcpServerTest, SetExWithZeroTtlExpiresImmediately) {
+  RawClient client(port_);
+  EXPECT_EQ(client.SendLine("SETEX tcp_ttl_zero 0 value"), "OK\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_ttl_zero"), "NOT_FOUND\r\n");
+}
+
+TEST_F(TcpServerTest, SetExWithLongTtlIsRetrievable) {
+  RawClient client(port_);
+  EXPECT_EQ(client.SendLine("SETEX tcp_ttl_long 3600 value"), "OK\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_ttl_long"), "VALUE value\r\n");
+}
+
+TEST_F(TcpServerTest, CompactViaWireShrinksFileAndKeepsLatestValue) {
+  RawClient client(port_);
+  client.SendLine("SET tcp_compact this version is stale and gets overwritten");
+  client.SendLine("SET tcp_compact new");
+  const auto size_before = std::filesystem::file_size(*path_);
+
+  EXPECT_EQ(client.SendLine("COMPACT"), "OK\r\n");
+
+  EXPECT_LT(std::filesystem::file_size(*path_), size_before);
+  EXPECT_EQ(client.SendLine("GET tcp_compact"), "VALUE new\r\n");
+}
+
 }  // namespace
 }  // namespace kv

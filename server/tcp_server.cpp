@@ -145,8 +145,14 @@ std::string TcpServer::HandleLine(const std::string& line) {
     case CommandType::kSet:
       engine_.Put(command.key, command.value);
       return "OK\r\n";
+    case CommandType::kSetEx:
+      engine_.Put(command.key, command.value, std::chrono::seconds(command.ttl_seconds));
+      return "OK\r\n";
     case CommandType::kDel:
       engine_.Delete(command.key);
+      return "OK\r\n";
+    case CommandType::kCompact:
+      engine_.Compact();
       return "OK\r\n";
     case CommandType::kInvalid:
       return "ERROR " + command.error + "\r\n";

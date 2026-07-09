@@ -1,8 +1,10 @@
 #include "kv/storage_engine.h"
 
+#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "file_handle.h"
@@ -10,8 +12,20 @@
 
 namespace kv {
 
+namespace {
+
+std::uint64_t NowUnixSeconds() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+bool IsExpired(std::uint64_t expires_at, std::uint64_t now) { return expires_at != 0 && expires_at <= now; }
+
+}  // namespace
+
 StorageEngine::StorageEngine(std::filesystem::path log_path)
-    : file_(std::make_unique<FileHandle>(log_path)) {
+    : log_path_(std::move(log_path)), file_(std::make_unique<FileHandle>(log_path_)) {
   RebuildIndexFromLog();
 }
 
@@ -38,6 +52,7 @@ StorageEngine::~StorageEngine() = default;
 // different problem than crash recovery.
 void StorageEngine::RebuildIndexFromLog() {
   const std::uint64_t file_size = file_->Size();
+  const std::uint64_t now = NowUnixSeconds();
   std::uint64_t offset = 0;
   std::vector<char> buffer;
 
@@ -79,10 +94,15 @@ void StorageEngine::RebuildIndexFromLog() {
 
     if (record.tombstone) {
       index_.erase(record.key);
+    } else if (IsExpired(record.expires_at, now)) {
+      // Already expired by the time we're loading it (e.g. the process was
+      // down past a short TTL) - treat it as absent rather than inserting
+      // it just to have Get() immediately hide it again.
+      index_.erase(record.key);
     } else {
       const std::uint64_t value_offset = offset + kLogRecordHeaderSize + record.key.size();
-      index_[record.key] =
-          IndexEntry{value_offset, static_cast<std::uint32_t>(record.value.size())};
+      index_[record.key] = IndexEntry{value_offset, static_cast<std::uint32_t>(record.value.size()),
+                                       record.expires_at};
     }
 
     offset += record_len;
@@ -96,8 +116,9 @@ void StorageEngine::RebuildIndexFromLog() {
 // crash." Doing it unconditionally for now; batching/async fsync is exactly
 // the kind of thing to measure and tune once there's a benchmark harness,
 // not guess at up front.
-std::uint64_t StorageEngine::Append(std::string_view key, std::string_view value, bool tombstone) {
-  const std::string record = EncodeLogRecord(key, value, tombstone);
+std::uint64_t StorageEngine::Append(std::string_view key, std::string_view value, bool tombstone,
+                                     std::uint64_t expires_at) {
+  const std::string record = EncodeLogRecord(key, value, tombstone, expires_at);
   const std::uint64_t offset = next_offset_;
   file_->Write(offset, record.data(), record.size());
   file_->Sync();
@@ -105,11 +126,13 @@ std::uint64_t StorageEngine::Append(std::string_view key, std::string_view value
   return offset;
 }
 
-void StorageEngine::Put(std::string_view key, std::string_view value) {
+void StorageEngine::Put(std::string_view key, std::string_view value, std::optional<std::chrono::seconds> ttl) {
+  const std::uint64_t expires_at = ttl.has_value() ? NowUnixSeconds() + static_cast<std::uint64_t>(ttl->count()) : 0;
+
   std::unique_lock lock(mutex_);
-  const std::uint64_t offset = Append(key, value, /*tombstone=*/false);
+  const std::uint64_t offset = Append(key, value, /*tombstone=*/false, expires_at);
   const std::uint64_t value_offset = offset + kLogRecordHeaderSize + key.size();
-  index_[std::string(key)] = IndexEntry{value_offset, static_cast<std::uint32_t>(value.size())};
+  index_[std::string(key)] = IndexEntry{value_offset, static_cast<std::uint32_t>(value.size()), expires_at};
 }
 
 // No checksum check here on purpose - by the time a key is in the index, its
@@ -120,11 +143,18 @@ void StorageEngine::Put(std::string_view key, std::string_view value) {
 //
 // Shared lock: any number of Gets can run at once, since none of them
 // mutate the index or the file - they just need to not overlap with a
-// Put/Delete that's actively changing the index out from under them.
+// Put/Delete that's actively changing the index out from under them. That's
+// also why an expired key found here isn't erased from the index: doing
+// that would need a write lock, which would mean upgrading a shared lock to
+// an exclusive one mid-read (its own can of worms) for a cleanup that
+// Compact() already handles.
 std::optional<std::string> StorageEngine::Get(std::string_view key) const {
   std::shared_lock lock(mutex_);
   const auto it = index_.find(std::string(key));
   if (it == index_.end()) {
+    return std::nullopt;
+  }
+  if (IsExpired(it->second.expires_at, NowUnixSeconds())) {
     return std::nullopt;
   }
   std::string value(it->second.value_len, '\0');
@@ -144,6 +174,59 @@ void StorageEngine::Delete(std::string_view key) {
   }
   Append(key, {}, /*tombstone=*/true);
   index_.erase(std::string(key));
+}
+
+// Rewrites the log from scratch into a temp file containing only what the
+// index says is currently live, then atomically renames it over the real
+// log. rename() replacing an existing path is atomic on POSIX, so this is
+// crash-safe without any extra bookkeeping: either the crash happens before
+// the rename (original log untouched, nothing lost) or after it succeeds
+// (new compacted log fully in place) - there's no window where the log on
+// disk is a partial mix of both. The one gap this doesn't close: the
+// temp file's data is fsynced before the rename, but the containing
+// directory entry isn't separately fsynced, so a power loss at exactly the
+// wrong instant could still lose the rename on some filesystems. That's
+// outside this project's threat model so far (process crashes, not power
+// loss), so it's accepted rather than solved.
+void StorageEngine::Compact() {
+  std::unique_lock lock(mutex_);
+
+  const std::filesystem::path tmp_path = log_path_.string() + ".compact";
+  auto tmp_file = std::make_unique<FileHandle>(tmp_path);
+  tmp_file->Truncate(0);  // in case a previous compaction crashed partway through
+
+  const std::uint64_t now = NowUnixSeconds();
+  std::unordered_map<std::string, IndexEntry> new_index;
+  std::uint64_t new_offset = 0;
+
+  for (const auto& [key, entry] : index_) {
+    if (IsExpired(entry.expires_at, now)) {
+      continue;  // compaction is also where expired keys actually get reclaimed
+    }
+
+    std::string value(entry.value_len, '\0');
+    file_->Read(entry.value_offset, value.data(), entry.value_len);
+
+    const std::string record = EncodeLogRecord(key, value, /*tombstone=*/false, entry.expires_at);
+    tmp_file->Write(new_offset, record.data(), record.size());
+
+    const std::uint64_t value_offset = new_offset + kLogRecordHeaderSize + key.size();
+    new_index[key] = IndexEntry{value_offset, entry.value_len, entry.expires_at};
+    new_offset += record.size();
+  }
+  tmp_file->Sync();
+  tmp_file.reset();  // close before renaming over it
+
+  std::filesystem::rename(tmp_path, log_path_);
+
+  // The fd file_ currently holds still refers to the pre-compaction data
+  // (rename doesn't retarget an already-open fd), so it has to be reopened
+  // against the now-compacted file at log_path_. Dropping the old FileHandle
+  // closes the last reference to the old (now unlinked) log, which is what
+  // actually frees its disk space.
+  file_ = std::make_unique<FileHandle>(log_path_);
+  index_ = std::move(new_index);
+  next_offset_ = new_offset;
 }
 
 std::size_t StorageEngine::KeyCount() const {

@@ -17,19 +17,35 @@ void AppendU32(std::string& out, std::uint32_t value) {
   out.push_back(static_cast<char>((value >> 24) & 0xFF));
 }
 
+void AppendU64(std::string& out, std::uint64_t value) {
+  for (int shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((value >> shift) & 0xFF));
+  }
+}
+
 std::uint32_t ReadU32(const unsigned char* p) {
   return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
          (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
+std::uint64_t ReadU64(const unsigned char* p) {
+  std::uint64_t value = 0;
+  for (int i = 0; i < 8; ++i) {
+    value |= static_cast<std::uint64_t>(p[i]) << (8 * i);
+  }
+  return value;
+}
+
 }  // namespace
 
-std::string EncodeLogRecord(std::string_view key, std::string_view value, bool tombstone) {
+std::string EncodeLogRecord(std::string_view key, std::string_view value, bool tombstone,
+                             std::uint64_t expires_at) {
   std::string body;
-  body.reserve(1 + 4 + 4 + key.size() + (tombstone ? 0 : value.size()));
+  body.reserve(1 + 4 + 4 + 8 + key.size() + (tombstone ? 0 : value.size()));
   body.push_back(static_cast<char>(tombstone ? kTombstoneFlag : 0));
   AppendU32(body, static_cast<std::uint32_t>(key.size()));
   AppendU32(body, static_cast<std::uint32_t>(tombstone ? 0 : value.size()));
+  AppendU64(body, tombstone ? 0 : expires_at);
   body.append(key);
   if (!tombstone) {
     body.append(value);
@@ -74,6 +90,7 @@ DecodedRecord DecodeLogRecord(const char* data, std::size_t length) {
   const bool tombstone = (flags & kTombstoneFlag) != 0;
   const std::uint32_t key_len = ReadU32(bytes + 5);
   const std::uint32_t value_len = ReadU32(bytes + 9);
+  const std::uint64_t expires_at = ReadU64(bytes + 13);
 
   const std::size_t expected = kLogRecordHeaderSize + key_len + (tombstone ? 0 : value_len);
   if (length != expected) {
@@ -82,6 +99,7 @@ DecodedRecord DecodeLogRecord(const char* data, std::size_t length) {
 
   DecodedRecord result;
   result.tombstone = tombstone;
+  result.expires_at = expires_at;
   result.key.assign(data + kLogRecordHeaderSize, key_len);
   if (!tombstone) {
     result.value.assign(data + kLogRecordHeaderSize + key_len, value_len);

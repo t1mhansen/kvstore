@@ -49,5 +49,26 @@ TEST(LogRecordTest, PeekHeaderMatchesDecode) {
   EXPECT_EQ(fields.value_len, 5u);
 }
 
+TEST(LogRecordTest, ExpiresAtRoundTrips) {
+  const std::string record = EncodeLogRecord("k", "v", /*tombstone=*/false, /*expires_at=*/1234567890ull);
+  const DecodedRecord decoded = DecodeLogRecord(record.data(), record.size());
+
+  EXPECT_EQ(decoded.expires_at, 1234567890ull);
+}
+
+TEST(LogRecordTest, DefaultExpiresAtIsZero) {
+  const std::string record = EncodeLogRecord("k", "v", /*tombstone=*/false);
+  const DecodedRecord decoded = DecodeLogRecord(record.data(), record.size());
+
+  EXPECT_EQ(decoded.expires_at, 0u);
+}
+
+TEST(LogRecordTest, TombstoneIgnoresExpiresAt) {
+  const std::string record = EncodeLogRecord("k", "v", /*tombstone=*/true, /*expires_at=*/999ull);
+  const DecodedRecord decoded = DecodeLogRecord(record.data(), record.size());
+
+  EXPECT_EQ(decoded.expires_at, 0u);
+}
+
 }  // namespace
 }  // namespace kv

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -46,18 +47,31 @@ class StorageEngine {
   StorageEngine(StorageEngine&&) = delete;
   StorageEngine& operator=(StorageEngine&&) = delete;
 
-  void Put(std::string_view key, std::string_view value);
+  // ttl, if given, is how long from now the key should live. Writing a key
+  // with no ttl (a plain SET) clears any TTL a previous version of the key
+  // had, since this always replaces the whole index entry.
+  void Put(std::string_view key, std::string_view value,
+           std::optional<std::chrono::seconds> ttl = std::nullopt);
   std::optional<std::string> Get(std::string_view key) const;
   void Delete(std::string_view key);
+
+  // Rewrites the log to contain only each live key's latest value, dropping
+  // overwritten versions, tombstoned keys, and expired keys. Blocks all
+  // other access for the duration - see the class comment on why this
+  // doesn't try to be a non-blocking/background operation.
+  void Compact();
 
   std::size_t KeyCount() const;
 
  private:
   // Points straight at the value bytes in the log, not the record start, so
   // Get() is exactly one pread with no header parsing on the read path.
+  // expires_at is duplicated here (not just read off disk) so checking
+  // whether a key is expired never costs a disk read.
   struct IndexEntry {
     std::uint64_t value_offset;
     std::uint32_t value_len;
+    std::uint64_t expires_at;  // unix seconds; 0 = never expires
   };
 
   void RebuildIndexFromLog();
@@ -66,8 +80,10 @@ class StorageEngine {
   // caller (Put/Delete) must already hold mutex_ for the whole logical
   // operation, not just this write, otherwise Delete's "does this key
   // exist" check and its later erase could race against another thread.
-  std::uint64_t Append(std::string_view key, std::string_view value, bool tombstone);
+  std::uint64_t Append(std::string_view key, std::string_view value, bool tombstone,
+                        std::uint64_t expires_at = 0);
 
+  std::filesystem::path log_path_;
   std::unique_ptr<FileHandle> file_;
   std::unordered_map<std::string, IndexEntry> index_;
   std::uint64_t next_offset_ = 0;  // end of the log; where the next append lands
