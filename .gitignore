@@ -1,0 +1,9 @@
+/build/
+/out/
+*.o
+*.obj
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+.DS_Store
