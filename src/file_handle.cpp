@@ -99,4 +99,13 @@ std::uint64_t FileHandle::Size() const {
   return static_cast<std::uint64_t>(st.st_size);
 }
 
+// Used to chop a torn/corrupt trailing record off the log during crash
+// recovery, so the file on disk actually matches what the index says it
+// contains instead of just carrying dead bytes past a logical cutoff.
+void FileHandle::Truncate(std::uint64_t new_size) const {
+  if (::ftruncate(fd_, static_cast<off_t>(new_size)) == -1) {
+    ThrowErrno("ftruncate");
+  }
+}
+
 }  // namespace kv

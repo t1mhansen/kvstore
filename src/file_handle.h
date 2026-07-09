@@ -30,6 +30,7 @@ class FileHandle {
   void Read(std::uint64_t offset, void* out, std::size_t length) const;
   void Sync() const;
   std::uint64_t Size() const;
+  void Truncate(std::uint64_t new_size) const;
 
  private:
   void Close() noexcept;
