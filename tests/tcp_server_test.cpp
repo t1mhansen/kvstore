@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 
@@ -68,55 +69,62 @@ class RawClient {
   int fd_ = -1;
 };
 
+// TcpServer has no graceful shutdown (see tcp_server.h) - its accept loop
+// runs on a background thread forever. That means a TcpServer can never be
+// safely destroyed while that thread might still touch it, so this suite
+// builds exactly one server for all tests (SetUpTestSuite, not SetUp) and
+// never tears it down. An earlier version constructed a fresh TcpServer per
+// test and leaked a thread each time; ThreadSanitizer caught the resulting
+// race (later tests' destructors closing a socket a still-running accept()
+// from an *earlier* test was blocked on).
+//
+// One shared server for the whole suite means tests must not collide on
+// keys, so each test uses its own key prefix.
 class TcpServerTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    const auto* test_info = ::testing::UnitTest::GetInstance()->current_test_info();
-    path_ = std::filesystem::temp_directory_path() /
-            (std::string("kv_server_test_") + test_info->test_suite_name() + "_" +
-             test_info->name() + ".log");
-    std::filesystem::remove(path_);
-
-    engine_ = std::make_unique<StorageEngine>(path_);
-    server_ = std::make_unique<TcpServer>(*engine_);
+  static void SetUpTestSuite() {
+    const auto path = std::filesystem::temp_directory_path() / "kv_server_test_suite.log";
+    std::filesystem::remove(path);
+    path_ = new std::filesystem::path(path);
+    engine_ = new StorageEngine(path);
+    server_ = new TcpServer(*engine_);
     port_ = server_->Listen(/*port=*/0);
-
-    // Intentionally leaked: the accept loop blocks forever, and there's no
-    // Stop() (see tcp_server.h). Fine for a short-lived test binary - the
-    // process exiting reclaims the thread and socket regardless.
-    std::thread(&TcpServer::AcceptLoop, server_.get()).detach();
+    std::thread(&TcpServer::AcceptLoop, server_).detach();
   }
 
-  void TearDown() override { std::filesystem::remove(path_); }
-
-  std::filesystem::path path_;
-  std::unique_ptr<StorageEngine> engine_;
-  std::unique_ptr<TcpServer> server_;
-  std::uint16_t port_ = 0;
+  static std::filesystem::path* path_;
+  static StorageEngine* engine_;
+  static TcpServer* server_;
+  static std::uint16_t port_;
 };
+
+std::filesystem::path* TcpServerTest::path_ = nullptr;
+StorageEngine* TcpServerTest::engine_ = nullptr;
+TcpServer* TcpServerTest::server_ = nullptr;
+std::uint16_t TcpServerTest::port_ = 0;
 
 TEST_F(TcpServerTest, GetOnMissingKeyReturnsNotFound) {
   RawClient client(port_);
-  EXPECT_EQ(client.SendLine("GET missing"), "NOT_FOUND\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_missing"), "NOT_FOUND\r\n");
 }
 
 TEST_F(TcpServerTest, SetThenGetRoundTrips) {
   RawClient client(port_);
-  EXPECT_EQ(client.SendLine("SET foo bar"), "OK\r\n");
-  EXPECT_EQ(client.SendLine("GET foo"), "VALUE bar\r\n");
+  EXPECT_EQ(client.SendLine("SET tcp_foo bar"), "OK\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_foo"), "VALUE bar\r\n");
 }
 
 TEST_F(TcpServerTest, ValueWithSpacesRoundTrips) {
   RawClient client(port_);
-  EXPECT_EQ(client.SendLine("SET foo bar baz"), "OK\r\n");
-  EXPECT_EQ(client.SendLine("GET foo"), "VALUE bar baz\r\n");
+  EXPECT_EQ(client.SendLine("SET tcp_spaces bar baz"), "OK\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_spaces"), "VALUE bar baz\r\n");
 }
 
 TEST_F(TcpServerTest, DeleteRemovesKey) {
   RawClient client(port_);
-  client.SendLine("SET foo bar");
-  EXPECT_EQ(client.SendLine("DEL foo"), "OK\r\n");
-  EXPECT_EQ(client.SendLine("GET foo"), "NOT_FOUND\r\n");
+  client.SendLine("SET tcp_del bar");
+  EXPECT_EQ(client.SendLine("DEL tcp_del"), "OK\r\n");
+  EXPECT_EQ(client.SendLine("GET tcp_del"), "NOT_FOUND\r\n");
 }
 
 TEST_F(TcpServerTest, MalformedCommandReturnsError) {
@@ -127,20 +135,22 @@ TEST_F(TcpServerTest, MalformedCommandReturnsError) {
 
 TEST_F(TcpServerTest, WritesFromOneClientAreVisibleToAnother) {
   RawClient writer(port_);
-  writer.SendLine("SET shared value");
+  writer.SendLine("SET tcp_shared value");
 
   RawClient reader(port_);
-  EXPECT_EQ(reader.SendLine("GET shared"), "VALUE value\r\n");
+  EXPECT_EQ(reader.SendLine("GET tcp_shared"), "VALUE value\r\n");
 }
 
-TEST_F(TcpServerTest, DataSurvivesServerRestart) {
-  {
-    RawClient client(port_);
-    client.SendLine("SET durable yes");
-  }
+// Proves the network path is actually durable, not just visible in memory:
+// Put() fsyncs before the server ever replies OK, so by the time SendLine()
+// returns, a second, completely independent StorageEngine opened on the same
+// log file should already see the write.
+TEST_F(TcpServerTest, WritesAreDurableOnDisk) {
+  RawClient client(port_);
+  ASSERT_EQ(client.SendLine("SET tcp_durable yes"), "OK\r\n");
 
-  StorageEngine reopened(path_);
-  EXPECT_EQ(reopened.Get("durable"), "yes");
+  StorageEngine independent_reader(*path_);
+  EXPECT_EQ(independent_reader.Get("tcp_durable"), "yes");
 }
 
 }  // namespace

@@ -6,9 +6,9 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <iostream>
-#include <mutex>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -87,6 +87,10 @@ void TcpServer::AcceptLoop() {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd == -1) {
       std::cerr << "kv_server: accept failed: " << std::strerror(errno) << "\n";
+      // If the listening socket is in a bad state, accept() can start
+      // failing instantly and repeatedly - without a pause this would spin
+      // the CPU at 100% retrying forever instead of just logging once.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
     std::thread(&TcpServer::HandleConnection, this, client_fd).detach();
@@ -133,7 +137,6 @@ void TcpServer::HandleConnection(int client_fd) {
 std::string TcpServer::HandleLine(const std::string& line) {
   const Command command = ParseCommand(line);
 
-  std::lock_guard<std::mutex> lock(engine_mutex_);
   switch (command.type) {
     case CommandType::kGet: {
       const auto value = engine_.Get(command.key);

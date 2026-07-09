@@ -1,6 +1,7 @@
 #include "kv/storage_engine.h"
 
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -15,8 +16,6 @@ StorageEngine::StorageEngine(std::filesystem::path log_path)
 }
 
 StorageEngine::~StorageEngine() = default;
-StorageEngine::StorageEngine(StorageEngine&&) noexcept = default;
-StorageEngine& StorageEngine::operator=(StorageEngine&&) noexcept = default;
 
 // Walks the whole log front to back and replays it into the index. Each
 // record's length depends on its own key_len/value_len, which live inside
@@ -107,6 +106,7 @@ std::uint64_t StorageEngine::Append(std::string_view key, std::string_view value
 }
 
 void StorageEngine::Put(std::string_view key, std::string_view value) {
+  std::unique_lock lock(mutex_);
   const std::uint64_t offset = Append(key, value, /*tombstone=*/false);
   const std::uint64_t value_offset = offset + kLogRecordHeaderSize + key.size();
   index_[std::string(key)] = IndexEntry{value_offset, static_cast<std::uint32_t>(value.size())};
@@ -117,7 +117,12 @@ void StorageEngine::Put(std::string_view key, std::string_view value) {
 // by RebuildIndexFromLog() when the store was opened. Re-verifying on every
 // single Get would mean re-reading and re-hashing the value on every read,
 // which defeats the point of the index.
+//
+// Shared lock: any number of Gets can run at once, since none of them
+// mutate the index or the file - they just need to not overlap with a
+// Put/Delete that's actively changing the index out from under them.
 std::optional<std::string> StorageEngine::Get(std::string_view key) const {
+  std::shared_lock lock(mutex_);
   const auto it = index_.find(std::string(key));
   if (it == index_.end()) {
     return std::nullopt;
@@ -127,12 +132,23 @@ std::optional<std::string> StorageEngine::Get(std::string_view key) const {
   return value;
 }
 
+// The exists-check, the append, and the erase all have to happen under one
+// lock acquisition, not one lock per step - otherwise two threads deleting
+// the same key could both pass the exists-check before either erases it,
+// and both would append a redundant tombstone. Locking the whole operation
+// makes it atomic from every other thread's point of view.
 void StorageEngine::Delete(std::string_view key) {
+  std::unique_lock lock(mutex_);
   if (index_.find(std::string(key)) == index_.end()) {
     return;  // key doesn't exist anywhere in the log; no tombstone needed
   }
   Append(key, {}, /*tombstone=*/true);
   index_.erase(std::string(key));
+}
+
+std::size_t StorageEngine::KeyCount() const {
+  std::shared_lock lock(mutex_);
+  return index_.size();
 }
 
 }  // namespace kv

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <mutex>
 
 #include "kv/storage_engine.h"
 
@@ -9,14 +8,9 @@ namespace kv {
 
 // Accepts TCP connections and serves them one OS thread per connection,
 // each thread doing blocking reads/writes and calling straight into a
-// shared StorageEngine.
-//
-// StorageEngine itself isn't thread-safe, so every call into it here goes
-// through a single coarse mutex - correct, but serializes all engine access
-// across every connection regardless of whether they touch the same key.
-// That's a deliberate placeholder: the real locking strategy (does GET need
-// exclusivity? can access be sharded by key?) is a separate design decision
-// with its own tradeoffs, not something to bolt on here.
+// shared StorageEngine. StorageEngine is thread-safe on its own (a
+// shared_mutex internally), so this class doesn't do any locking of its
+// own - concurrent connections just call into it directly.
 //
 // No graceful shutdown: Run() never returns. For a demo/benchmark process,
 // Ctrl-C killing the whole thing is the expected way to stop it, and the OS
@@ -44,7 +38,6 @@ class TcpServer {
 
   int listen_fd_ = -1;
   StorageEngine& engine_;
-  std::mutex engine_mutex_;
 };
 
 }  // namespace kv

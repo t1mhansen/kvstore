@@ -8,6 +8,7 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 add_executable(kv_tests
+  concurrency_test.cpp
   crash_recovery_test.cpp
   crc32_test.cpp
   log_record_test.cpp

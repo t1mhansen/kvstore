@@ -13,6 +13,12 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 option(KV_BUILD_TESTS "Build the test suite" ON)
+option(KV_ENABLE_TSAN "Build with ThreadSanitizer to catch data races" OFF)
+
+if(KV_ENABLE_TSAN)
+  add_compile_options(-fsanitize=thread -g)
+  add_link_options(-fsanitize=thread)
+endif()
 
 find_package(Threads REQUIRED)
 
