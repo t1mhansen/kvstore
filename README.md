@@ -20,6 +20,48 @@ speaking a small custom protocol.
 Non-goals: distributed consensus/replication, a query language beyond
 GET/SET/DEL(+TTL), and production hardening (auth, TLS, ACLs).
 
+## Architecture
+
+```
+  client 1 ─┐
+  client 2 ─┼── TCP :port ── TcpServer (accept loop, 1 OS thread per connection)
+  client N ─┘                        │
+                                      │ Put / Get / Delete / Compact
+                                      ▼
+                               StorageEngine (shared_mutex: shared for reads,
+                               │              exclusive for writes/compact)
+                               │
+                   ┌───────────┴───────────┐
+                   ▼                       ▼
+            index_ (RAM)             FileHandle (fd)
+        {key -> offset, len,               │
+         expires_at}                       ▼
+                                      <log-path> on disk
+                              (append-only, checksummed records)
+```
+
+`GET` is a hash lookup plus one `pread` at a known offset - it never scans the
+log. `PUT`/`DELETE` append a record and (depending on `SyncPolicy`) `fsync`
+before returning. Opening an existing log replays it front-to-back to rebuild
+`index_`; a torn record at the very end (the only place a crash can leave one,
+since every earlier record was already durable before the next write began)
+gets detected and the file truncated back to the last good record.
+
+## Design decisions
+
+The full reasoning for each of these lives as comments next to the code, not
+duplicated here - this is a map of where to look, not the argument itself.
+
+| Decision | Choice | Why (see) |
+|---|---|---|
+| Storage engine | Bitcask-style: append-only log + in-memory hash index | [storage_engine.h](include/kv/storage_engine.h) - simple enough to fully own solo; an LSM-tree's compaction/leveling machinery wasn't worth the risk of a shaky, half-understood implementation |
+| File I/O | Raw `pread`/`pwrite`/`fsync`, not iostreams | [file_handle.h](src/file_handle.h) - iostreams don't expose `fsync` at all, and durability needs to be an explicit, visible call |
+| Corruption detection | Hand-rolled CRC32 | [crc32.h](src/crc32.h) - detects the burst errors a torn write actually produces; small enough to own outright instead of pulling in zlib |
+| Network I/O model | Thread-per-connection | [tcp_server.h](server/tcp_server.h) - gives the concurrency work a real problem to solve; `epoll`/`kqueue` are platform-specific and add a lot of state-machine complexity for a project this size |
+| Wire protocol | Line-based text | [protocol.h](server/protocol.h) - demoable by hand with `nc`; a length-prefixed binary format can't be typed at a terminal |
+| Locking | Single `shared_mutex`: shared for GET, exclusive for PUT/DELETE/COMPACT | [storage_engine.h](include/kv/storage_engine.h) - reads never block each other; per-key sharded locks wouldn't buy real write concurrency anyway, since every write still funnels through one log file with one offset allocator |
+| Compaction | Full rewrite + atomic `rename()` | [storage_engine.cpp](src/storage_engine.cpp) - `rename()`'s atomicity makes this crash-safe for free, no extra bookkeeping; costs a stop-the-world pause that segmented logs would avoid |
+
 ## Protocol
 
 One command per line, testable by hand with `nc`:
@@ -30,6 +72,25 @@ SET key value
 SETEX key seconds value
 DEL key
 COMPACT
+```
+
+Example session (after `kv_server 9000 /tmp/demo.log`):
+
+```
+$ nc localhost 9000
+SET name tim
+OK
+GET name
+VALUE tim
+SETEX temp 5 gone-soon
+OK
+GET temp
+VALUE gone-soon
+... wait 5+ seconds ...
+GET temp
+NOT_FOUND
+COMPACT
+OK
 ```
 
 ## Building
@@ -79,3 +140,36 @@ Two things worth calling out:
 `--no-fsync` trades power-loss durability for throughput; it doesn't change
 process-crash recovery, which works identically either way (see the
 `SyncPolicy` comment for why those are different guarantees).
+
+## Limitations
+
+Real, known gaps - not oversights, but scope decisions made explicit rather
+than left for someone to discover the hard way:
+
+- **The whole index must fit in RAM.** There's no support for a dataset
+  larger than memory, and no plan to add one - that's the fundamental
+  tradeoff of a hash-indexed design over a tree-indexed one like an LSM-tree.
+- **Point lookups only.** The hash index has no ordering, so there's no range
+  scan or prefix iteration - `GET`/`SET`/`DEL`/`SETEX` is the whole query
+  surface.
+- **`COMPACT` is stop-the-world.** It holds the exclusive lock for the entire
+  rewrite, blocking every other connection until it finishes. A segmented log
+  (compact old segments in the background while new writes land in a fresh
+  one) would avoid this, but that's a bigger structural change than this
+  project's single-log-file design.
+- **Crash recovery assumes only the tail of the log can be corrupted** - true
+  for a single writer that always fsyncs before its next write, but it means
+  corruption introduced some other way (disk bit rot, manually editing the
+  file) in the *middle* of the log wouldn't be detected or repaired; that
+  logic would silently truncate away everything after the first bad record,
+  valid or not.
+- **Compaction fsyncs the new file's data but not its directory entry**, so a
+  power loss at exactly the wrong instant around the `rename()` could in
+  theory still lose the rename on some filesystems.
+- **POSIX only.** Built directly on `pread`/`pwrite`/`fsync`/`ftruncate`, no
+  Windows support.
+- **No auth, no TLS.** Anyone who can open a TCP connection to the port has
+  full read/write/compact access.
+- **No graceful shutdown.** `kv_server` has no `Stop()` - Ctrl-C (or the OS
+  reclaiming the process) is the only way to stop it. Fine for a
+  demo/benchmark process, not for anything meant to stay up.
