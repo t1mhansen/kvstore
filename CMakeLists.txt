@@ -14,7 +14,10 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 option(KV_BUILD_TESTS "Build the test suite" ON)
 
+find_package(Threads REQUIRED)
+
 add_subdirectory(src)
+add_subdirectory(server)
 
 if(KV_BUILD_TESTS)
   enable_testing()
