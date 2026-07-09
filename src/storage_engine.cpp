@@ -24,8 +24,10 @@ bool IsExpired(std::uint64_t expires_at, std::uint64_t now) { return expires_at 
 
 }  // namespace
 
-StorageEngine::StorageEngine(std::filesystem::path log_path)
-    : log_path_(std::move(log_path)), file_(std::make_unique<FileHandle>(log_path_)) {
+StorageEngine::StorageEngine(std::filesystem::path log_path, SyncPolicy sync_policy)
+    : log_path_(std::move(log_path)),
+      sync_policy_(sync_policy),
+      file_(std::make_unique<FileHandle>(log_path_)) {
   RebuildIndexFromLog();
 }
 
@@ -111,17 +113,17 @@ void StorageEngine::RebuildIndexFromLog() {
   next_offset_ = offset;
 }
 
-// fsync on every single write is the safest, slowest option - it's the
-// difference between "durable" and "buffered by the OS and gone on a
-// crash." Doing it unconditionally for now; batching/async fsync is exactly
-// the kind of thing to measure and tune once there's a benchmark harness,
-// not guess at up front.
+// See the SyncPolicy comment in storage_engine.h for exactly what fsync
+// buys here (power-loss durability, not process-crash durability) and what
+// skipping it trades away.
 std::uint64_t StorageEngine::Append(std::string_view key, std::string_view value, bool tombstone,
                                      std::uint64_t expires_at) {
   const std::string record = EncodeLogRecord(key, value, tombstone, expires_at);
   const std::uint64_t offset = next_offset_;
   file_->Write(offset, record.data(), record.size());
-  file_->Sync();
+  if (sync_policy_ == SyncPolicy::kAlways) {
+    file_->Sync();
+  }
   next_offset_ += record.size();
   return offset;
 }

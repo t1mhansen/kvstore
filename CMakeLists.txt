@@ -24,6 +24,7 @@ find_package(Threads REQUIRED)
 
 add_subdirectory(src)
 add_subdirectory(server)
+add_subdirectory(bench)
 
 if(KV_BUILD_TESTS)
   enable_testing()

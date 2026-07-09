@@ -19,11 +19,26 @@ namespace kv {
 // the store is backed by raw POSIX file descriptors.
 class FileHandle;
 
+// Controls whether PUT/DELETE call fsync before returning. This is worth
+// being precise about: fsync protects against power loss / an OS crash, not
+// against a process crash. The OS page cache survives a killed or crashed
+// process, and RebuildIndexFromLog() replays correctly from whatever's in
+// the page cache regardless of this setting - crash recovery works the same
+// either way. What this setting actually trades away under kNever is
+// durability against a *power-loss*-class event: some tail of recent writes
+// could still be sitting unflushed in the page cache when the machine loses
+// power, and would be gone on reboot.
+enum class SyncPolicy {
+  kAlways,  // fsync every write (default) - safe against power loss too
+  kNever,   // never call fsync explicitly; let the OS decide when to flush
+};
+
 // Bitcask-style storage engine: every write is appended to a single log file
 // on disk, and an in-memory hash index maps each key to the offset/length of
 // its most recent value in that log. A GET is one pread at a known offset;
-// PUT/DELETE are one append + fsync. Opening an existing log file replays it
-// from the start to rebuild the index before the store is usable.
+// PUT/DELETE are one append (+ fsync, depending on SyncPolicy). Opening an
+// existing log file replays it from the start to rebuild the index before
+// the store is usable.
 //
 // Thread-safe for concurrent use by multiple callers (e.g. one thread per
 // network connection): GET takes a shared lock, PUT/DELETE take an
@@ -35,7 +50,7 @@ class FileHandle;
 // which is a bigger structural change than a locking scheme.
 class StorageEngine {
  public:
-  explicit StorageEngine(std::filesystem::path log_path);
+  explicit StorageEngine(std::filesystem::path log_path, SyncPolicy sync_policy = SyncPolicy::kAlways);
   ~StorageEngine();
 
   // Not movable or copyable: it owns a shared_mutex, and there's no
@@ -84,6 +99,7 @@ class StorageEngine {
                         std::uint64_t expires_at = 0);
 
   std::filesystem::path log_path_;
+  SyncPolicy sync_policy_;
   std::unique_ptr<FileHandle> file_;
   std::unordered_map<std::string, IndexEntry> index_;
   std::uint64_t next_offset_ = 0;  // end of the log; where the next append lands

@@ -161,5 +161,17 @@ TEST_F(StorageEngineTest, CompactedDataSurvivesReopen) {
   EXPECT_EQ(reopened.KeyCount(), 1u);
 }
 
+// SyncPolicy::kNever only changes when fsync is called, not correctness -
+// this just proves that plumbing actually works, not anything about
+// durability (that's what the benchmark, not a unit test, is for).
+TEST_F(StorageEngineTest, NoFsyncPolicyStillWorksCorrectly) {
+  StorageEngine engine(path_, SyncPolicy::kNever);
+  engine.Put("a", "1");
+  engine.Delete("a");
+  engine.Put("b", "2");
+  EXPECT_EQ(engine.Get("a"), std::nullopt);
+  EXPECT_EQ(engine.Get("b"), "2");
+}
+
 }  // namespace
 }  // namespace kv
